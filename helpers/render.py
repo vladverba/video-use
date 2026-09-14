@@ -622,20 +622,28 @@ def build_final_composite(
         inputs += ["-i", str(ov_path)]
 
     filter_parts: list[str] = []
-    # PTS-shift every overlay so its frame 0 lands at start_in_output
+    # PTS-shift every overlay so its frame 0 lands at start_in_output.
+    # Optional "width"/"height" scale the overlay to fit a region smaller than
+    # the base canvas (e.g. a 1440x1080 4:3 insert placed on a 1080x1920 base).
     for idx, ov in enumerate(overlays, start=1):
         t = float(ov["start_in_output"])
-        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
+        scale = ""
+        if "width" in ov and "height" in ov:
+            scale = f"scale={int(ov['width'])}:{int(ov['height'])},"
+        filter_parts.append(f"[{idx}:v]{scale}setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
 
-    # Chain overlays on top of base
+    # Chain overlays on top of base. Optional "x"/"y" position the (possibly
+    # scaled) overlay on the base canvas; both default to 0 (top-left).
     current = "[0:v]"
     for idx, ov in enumerate(overlays, start=1):
         t = float(ov["start_in_output"])
         dur = float(ov["duration"])
         end = t + dur
+        x = ov.get("x", 0)
+        y = ov.get("y", 0)
         next_label = f"[v{idx}]"
         filter_parts.append(
-            f"{current}[a{idx}]overlay=enable='between(t,{t:.3f},{end:.3f})'{next_label}"
+            f"{current}[a{idx}]overlay=x={x}:y={y}:enable='between(t,{t:.3f},{end:.3f})'{next_label}"
         )
         current = next_label
 

@@ -206,6 +206,7 @@ Pick the engine per animation slot. Do not default to Remotion just because the 
 - **Remotion** — React/CSS compositions with component state, reusable React primitives, or an existing Remotion brand system. Best when the user specifically asks for React/Remotion or when React composition is the simpler authoring model.
 - **Manim** — formal diagrams, state machines, equation derivations, graph morphs. Read `skills/manim-video/SKILL.md` and its references for depth.
 - **PIL + PNG sequence + ffmpeg** — simple overlay cards: counters, typewriter text, single bar reveals, progressive draws. Fast to iterate, any aesthetic you want. The launch video used this.
+- **Gated Remotion production skills** (`motion-graphics`, `cinematic-camera`, `terminal-inserts`, `article-highlights` — installed globally at `~/.claude/skills/` from `liamrjohnston/remotion-motion-graphics-skill`) — a heavier, production-hardened path: mandatory format/background intake, real-asset research, an approved-reference preflight, and a fresh independent critic sub-agent that must authorize the render before delivery. Slower per clip (each build is a full 7-stage gate, easily 20-40 min including its own critic review) but enforces a strict zero-neon/zero-fabricated-UI bar. Reach for this when the user wants "professional" motion graphics for a product/launch video and is fine with the added time; use the faster PIL/HyperFrames path for quick overlays or when iteration speed matters more than gate-verified polish. Brief the builder sub-agent to run the full gate itself (including spawning its own critic sub-agent — a builder must never grade its own work) and to cap self-revision at ~3 attempts, reporting back honestly if it can't reach the delivery-authorized state rather than looping forever.
 
 For HyperFrames slots, scaffold the slot inside `edit/animations/slot_<id>/` with `npx --yes hyperframes init . --example blank --non-interactive --skip-skills`, build the HTML composition there, run the HyperFrames checks that fit the slot (`lint`, `validate`, and a draft render when practical), then produce the final overlay video with `npx --yes hyperframes render . -o render.mp4` or `--format webm -o render.webm` when alpha is required. Point the EDL overlay `file` at the actual rendered path.
 
@@ -261,6 +262,10 @@ This is one style. If the brand is warm and serif, use that. If it's colorful an
 
 One sub-agent = one file (unique filenames, parallel agents don't overwrite each other).
 
+**Positioned/inset overlays** (e.g. a 4:3 1440×1080 "half-screen insert" composited into a 1080×1920 vertical canvas so the speaker stays visible around it): `render.py`'s overlay compositing supports optional `width`/`height` (scales the overlay to fit) and `x`/`y` (position on the base canvas; both default to 0) per overlay entry — see EDL format below. A full-canvas overlay (no `width`/`height`/`x`/`y`) behaves exactly as before.
+
+**Closing gaps between sequential overlays:** if one overlay's window ends before the next begins, the base footage flashes back to full-frame in between, which reads as a jarring on/off/on flicker rather than a continuous split-screen. Don't fix this by adding a fabricated lead-in to the *next* overlay — its opening frames are usually mid-entrance-animation (bad freeze candidate) and its choreography is likely word-synced (shifting it earlier desyncs it). Instead, extend the *earlier* overlay's already-static tail (most card/counter animations settle into a static hold before their window ends — confirm this first) to fill the gap: `ffmpeg`'s `tpad=stop_mode=clone:stop_duration=<gap_seconds>` clones its last frame for exactly the gap length, then continue the setpts shift as usual. This makes the handoff a clean hard cut between two settled states instead of a flash to the base footage.
+
 ## Output spec
 
 Match the source unless the user asked for something specific. Common targets: `1920×1080@24` cinematic, `1920×1080@30` screen content, `1080×1920@30` vertical social, `3840×2160@24` 4K cinema, `1080×1080@30` square. `render.py` defaults the scale to 1080p from any source; pass `--filter` or edit the extract command for other targets. Worth asking the user which delivery format matters.
@@ -279,14 +284,16 @@ Match the source unless the user asked for something specific. Common targets: `
   ],
   "grade": "warm_cinematic",
   "overlays": [
-    {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
+    {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0},
+    {"file": "edit/animations/slot_2/render.mp4", "start_in_output": 5.0, "duration": 6.0,
+     "width": 1080, "height": 810, "x": 0, "y": 0}
   ],
   "subtitles": "edit/master.srt",
   "total_duration_s": 87.4
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips — `width`/`height` scale an overlay to fit a region smaller than the base canvas (e.g. a 1440×1080 4:3 insert placed on a 1080×1920 base), `x`/`y` position it there (both default to 0, i.e. full-canvas top-left, matching the pre-existing behavior when omitted). `subtitles` is optional and applied LAST.
 
 ## Memory — `project.md`
 
