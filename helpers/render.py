@@ -231,6 +231,109 @@ def probe_source_fps(video: Path) -> str | None:
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
+def _probe_rms_db(source: Path, t0: float, t1: float) -> float:
+    """Mean RMS level (dB) of source's audio over [t0, t1]. -100.0 if silent/unreadable."""
+    if t1 <= t0:
+        return -100.0
+    cmd = [
+        "ffmpeg", "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{t1:.4f}",
+        "-i", str(source), "-af", "astats=metadata=0", "-f", "null", "-",
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True).stderr
+    vals = re.findall(r"RMS level dB:\s*(-?[\d.]+|-inf)", out)
+    if not vals:
+        return -100.0
+    last = vals[-1]
+    return -100.0 if last == "-inf" else float(last)
+
+
+def _earliest_silence_start(
+    source: Path, end: float, lookback: float, noise_db: int, min_dur: float
+) -> float | None:
+    """Earliest `silence_start` within [end - lookback, end] of source's audio
+    at the given threshold. Returns an absolute timestamp, or None if none
+    found. This is only a first guess at a correction point — by itself it
+    cannot tell a genuine trailing silence apart from an ordinary
+    mid-sentence pause earlier in the segment, or from a long silence that a
+    sub-millisecond noise blip has split into two adjacent silence_start
+    events (observed in practice — ffmpeg's threshold crossing is not
+    perfectly stable at a single sample). Taking the earliest one and
+    verifying the whole span through `end` in `verify_segment_end` handles
+    both: a real mid-sentence pause fails that span check (real speech
+    follows before `end`) and is correctly rejected, while a genuinely
+    continuous trailing silence (blip included) passes it.
+    """
+    t0 = max(0.0, end - lookback)
+    if end <= t0:
+        return None
+    cmd = [
+        "ffmpeg", "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{end:.4f}",
+        "-i", str(source),
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+        "-f", "null", "-",
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True).stderr
+    starts = [t0 + float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", out)]
+    return min(starts) if starts else None
+
+
+def verify_segment_end(
+    source: Path, start: float, end: float, pad: float = 0.04, verbose: bool = True
+) -> float:
+    """Guard against ASR last-word timestamp drift before trusting a cut end.
+
+    Every segment end in this pipeline comes from a transcript phrase break on
+    a silence gap — exactly the case where Scribe's end timestamp for the last
+    word can drift 0.5-2s+ late, since there's no next word to bound it
+    against (far beyond the ~50-100ms drift Rule 7 already accounts for).
+    Cutting where the waveform first drops under a loose threshold still
+    catches the word's decay tail, not true silence, so the baked-in 30ms
+    fade-out (Rule 3) audibly chops real sound instead of fading silence.
+
+    Finds a candidate cut point at the strict (-45dB) noise-floor boundary,
+    then requires the ENTIRE span from that candidate through the original
+    `end` to measure as silent (via `_probe_rms_db`), not just that a silence
+    event exists somewhere nearby — an earlier mid-sentence pause followed by
+    more real speech before `end` fails that check (the span includes that
+    speech, so its average RMS reads loud) and is correctly left alone.
+
+    That span-average check is NOT sufficient by itself, though: a stop
+    consonant's silent closure phase (e.g. the "k" in "works.") can register
+    as near-silence even though the word's release burst and trailing
+    fricative haven't played out yet, and a short loud blip surrounded by
+    quiet can still average below the threshold over the whole span (caught
+    a real case — "works." got clipped mid-consonant this way, a 0.237s
+    over-correction that landed inside the word, not after it). The minimum
+    correction-magnitude gate below is the actual safety margin against that:
+    genuine ASR drift bugs measured 0.86s and 2.2s of excess trailing dead
+    air, while ordinary consonant closures and normal end-of-take padding
+    measured up to ~0.46s across otherwise-fine segments in the same edit.
+    0.5s sits comfortably between the two, so only unambiguous cases correct.
+    Never pushes the end past the original ASR timestamp.
+    """
+    duration = end - start
+    if duration <= 0.05:
+        return end
+
+    lookback = min(duration, 3.0)
+    candidate_start = _earliest_silence_start(source, end, lookback, noise_db=-45, min_dur=0.05)
+    if candidate_start is None:
+        return end
+
+    candidate = min(end, candidate_start + pad)
+    if (end - candidate) <= 0.5:
+        return end  # not enough excess to bother correcting
+
+    span_rms = _probe_rms_db(source, candidate, end)
+    if span_rms > -45.0:
+        return end  # real sound somewhere in [candidate, end]; leave it alone
+
+    if verbose:
+        print(f"        [verify] end {end:.3f} -> {candidate:.3f}s "
+              f"(ASR timestamp drift / mid-decay cut)")
+    return candidate
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -346,7 +449,7 @@ def extract_all_segments(
         src_name = r["source"]
         src_path = resolve_path(sources[src_name], edit_dir)
         start = float(r["start"])
-        end = float(r["end"])
+        end = verify_segment_end(src_path, start, float(r["end"]))
         duration = end - start
         out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
