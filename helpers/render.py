@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from fractions import Fraction
@@ -37,6 +38,11 @@ except Exception:
 
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
+
+# speed.py is stdlib-only and required, so make the sibling import work even
+# when render.py is loaded by path (tests) rather than run from helpers/.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speed import atempo_chain  # noqa: E402
 
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
@@ -57,6 +63,21 @@ SUB_FORCE_STYLE = (
 )
 
 # -------- Helpers ------------------------------------------------------------
+
+
+def _prefer_native(name: str) -> str:
+    """Prefer the Apple Silicon Homebrew build when installed.
+
+    An x86_64 ffmpeg under Rosetta has no VideoToolbox hardware access and
+    runs libx265 ~3x slower than the native arm64 build. Falls back to
+    whatever `name` resolves to on PATH.
+    """
+    native = Path("/opt/homebrew/bin") / name
+    return str(native) if native.exists() else name
+
+
+FFMPEG = _prefer_native("ffmpeg")
+FFPROBE = _prefer_native("ffprobe")
 
 
 def run(cmd: list[str], quiet: bool = False) -> None:
@@ -122,7 +143,7 @@ def is_hdr_source(video: Path) -> bool:
     """Return True if the source uses a PQ or HLG transfer function."""
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=color_transfer",
              "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
             capture_output=True, text=True, check=True,
@@ -132,11 +153,93 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
+# -------- Final-quality encode (HDR-preserving) -----------------------------
+#
+# Final renders keep the source's look instead of downconverting: HEVC Main 10,
+# the source's own color tags (HLG/BT.2020 for iPhone HDR footage), `hvc1` so
+# iOS/QuickTime plays it. Encoded on the Mac's hardware HEVC encoder at 1.25x
+# the source bitrate: measured on 4K60 iPhone footage at VMAF 95.5 vs libx265
+# CRF 13's 95.3, ~14x faster (6s vs 82s per 5s of source).
+
+FINAL_BITRATE_FACTOR = 1.25
+FINAL_MIN_BITRATE = 12_000_000  # bits/s; floor for low-bitrate sources
+
+
+def probe_color_tags(video: Path) -> dict[str, str]:
+    """Source color tags that are actually set (unknown/missing omitted)."""
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=color_primaries,color_transfer,color_space,color_range",
+             "-of", "json", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        streams = json.loads(out.stdout).get("streams") or []
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return {}
+    if not streams:
+        return {}
+    return {
+        k: v for k, v in streams[0].items()
+        if k in ("color_primaries", "color_transfer", "color_space", "color_range")
+        and v and v != "unknown"
+    }
+
+
+def probe_video_bitrate(video: Path) -> int | None:
+    """Source video stream bitrate in bits/s, falling back to the container's."""
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=bit_rate:format=bit_rate",
+             "-of", "json", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(out.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return None
+    for value in ((data.get("streams") or [{}])[0].get("bit_rate"),
+                  (data.get("format") or {}).get("bit_rate")):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def final_video_args(source: Path) -> list[str]:
+    """ffmpeg video-encode args for a final render of a segment of `source`.
+
+    Color tags are copied from the source, never assumed, so an SDR source
+    is not mislabeled as HDR (or vice versa). Tags the source doesn't set
+    are left unset. `-allow_sw 1` lets the encode still succeed (slowly) on
+    a machine without the hardware encoder.
+    """
+    tags = probe_color_tags(source)
+    flags: list[str] = []
+    for tag, flag in (("color_primaries", "-color_primaries"),
+                      ("color_transfer", "-color_trc"),
+                      ("color_space", "-colorspace"),
+                      ("color_range", "-color_range")):
+        if tag in tags:
+            flags += [flag, tags[tag]]
+    bitrate = max(int((probe_video_bitrate(source) or 0) * FINAL_BITRATE_FACTOR),
+                  FINAL_MIN_BITRATE)
+    return [
+        "-c:v", "hevc_videotoolbox", "-allow_sw", "1",
+        "-profile:v", "main10", "-pix_fmt", "p010le",
+        "-b:v", str(bitrate),
+        *flags,
+        "-tag:v", "hvc1",
+    ]
+
+
 def is_portrait_source(video: Path) -> bool:
     """Return True if the displayed video is portrait, including rotation."""
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
              "-show_entries",
              "stream=width,height:stream_side_data=rotation",
              "-of", "json", str(video)],
@@ -198,6 +301,25 @@ def parse_fps(value: str) -> str:
     return f"{rate.numerator}/{rate.denominator}"
 
 
+# iPhone footage is nominally 30/1 but its timestamps jitter, so the average
+# lands at e.g. 961000/32041 (29.993, ~0.024% off). Snap to the nominal rate
+# within this tolerance. Kept below 0.1% so a genuine 30000/1001 (29.97) stream
+# tagged 30/1 nominal still keeps its real average.
+NOMINAL_SNAP_TOLERANCE = 0.0005
+
+
+def _snapped_nominal(stream: dict) -> str | None:
+    """Nominal rate if the average is within tolerance of it, else None."""
+    try:
+        avg = Fraction(parse_fps(stream.get("avg_frame_rate") or ""))
+        nominal = Fraction(parse_fps(stream.get("r_frame_rate") or ""))
+    except argparse.ArgumentTypeError:
+        return None
+    if abs(avg - nominal) / nominal <= NOMINAL_SNAP_TOLERANCE:
+        return f"{nominal.numerator}/{nominal.denominator}"
+    return None
+
+
 def probe_source_fps(video: Path) -> str | None:
     """Return an ffmpeg-ready source rate, preferring the average frame rate.
 
@@ -208,7 +330,7 @@ def probe_source_fps(video: Path) -> str | None:
     """
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=avg_frame_rate,r_frame_rate",
              "-of", "json", str(video)],
             capture_output=True, text=True, check=True,
@@ -216,6 +338,9 @@ def probe_source_fps(video: Path) -> str | None:
         streams = json.loads(out.stdout).get("streams") or []
         if not streams:
             return None
+        nominal = _snapped_nominal(streams[0])
+        if nominal is not None:
+            return nominal
         for field in ("avg_frame_rate", "r_frame_rate"):
             value = streams[0].get(field)
             if value and value != "0/0":
@@ -236,7 +361,7 @@ def _probe_rms_db(source: Path, t0: float, t1: float) -> float:
     if t1 <= t0:
         return -100.0
     cmd = [
-        "ffmpeg", "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{t1:.4f}",
+        FFMPEG, "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{t1:.4f}",
         "-i", str(source), "-af", "astats=metadata=0", "-f", "null", "-",
     ]
     out = subprocess.run(cmd, capture_output=True, text=True).stderr
@@ -247,34 +372,42 @@ def _probe_rms_db(source: Path, t0: float, t1: float) -> float:
     return -100.0 if last == "-inf" else float(last)
 
 
-def _earliest_silence_start(
+def _trailing_silence_start(
     source: Path, end: float, lookback: float, noise_db: int, min_dur: float
 ) -> float | None:
-    """Earliest `silence_start` within [end - lookback, end] of source's audio
-    at the given threshold. Returns an absolute timestamp, or None if none
-    found. This is only a first guess at a correction point — by itself it
-    cannot tell a genuine trailing silence apart from an ordinary
-    mid-sentence pause earlier in the segment, or from a long silence that a
-    sub-millisecond noise blip has split into two adjacent silence_start
-    events (observed in practice — ffmpeg's threshold crossing is not
-    perfectly stable at a single sample). Taking the earliest one and
-    verifying the whole span through `end` in `verify_segment_end` handles
-    both: a real mid-sentence pause fails that span check (real speech
-    follows before `end`) and is correctly rejected, while a genuinely
-    continuous trailing silence (blip included) passes it.
+    """Start of the silence run still open at `end`, within
+    [end - lookback, end] of source's audio at the given threshold. Returns
+    an absolute timestamp, or None if the audio is still sounding at `end`.
+
+    Must be the LAST silence_start with no matching silence_end before
+    `end` — not the earliest silence_start in the window. A word with
+    internal stop consonants (e.g. the closures inside "duplicates") produces
+    its own short silence_start/silence_end pairs that close well before
+    `end`; taking the earliest of those lands the correction candidate
+    before the word even finishes speaking. Only a silence run that is still
+    open when the probe window ends at `end` is a genuine candidate for
+    trailing dead air — confirmed against a real case where "duplicates."
+    had a 60ms inter-word gap register as the earliest silence_start, while
+    the true trailing silence didn't begin until ~0.74s later.
     """
     t0 = max(0.0, end - lookback)
     if end <= t0:
         return None
     cmd = [
-        "ffmpeg", "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{end:.4f}",
+        FFMPEG, "-nostdin", "-ss", f"{t0:.4f}", "-to", f"{end:.4f}",
         "-i", str(source),
         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
         "-f", "null", "-",
     ]
     out = subprocess.run(cmd, capture_output=True, text=True).stderr
-    starts = [t0 + float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", out)]
-    return min(starts) if starts else None
+    events = re.findall(r"silence_(start|end):\s*([\d.]+)", out)
+    open_start: float | None = None
+    for kind, val in events:
+        if kind == "start":
+            open_start = t0 + float(val)
+        else:
+            open_start = None
+    return open_start
 
 
 def verify_segment_end(
@@ -316,7 +449,7 @@ def verify_segment_end(
         return end
 
     lookback = min(duration, 3.0)
-    candidate_start = _earliest_silence_start(source, end, lookback, noise_db=-45, min_dur=0.05)
+    candidate_start = _trailing_silence_start(source, end, lookback, noise_db=-45, min_dur=0.05)
     if candidate_start is None:
         return end
 
@@ -343,43 +476,31 @@ def extract_segment(
     preview: bool = False,
     draft: bool = False,
     rate: str | None = None,
+    speed: float = 1.0,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+
+    `speed` != 1.0 time-stretches the segment in the same encode (video
+    `setpts`, pitch-preserving `atempo` audio), so a sped-up render costs no
+    extra generation of video encoding. `duration` is the *source* duration;
+    the segment comes out `duration / speed` long.
+
+    Final segments carry uncompressed PCM audio (so `out_path` should be
+    .mov). AAC per segment would add ~21ms of encoder priming/padding per
+    file, which players and loudnorm play back-to-back, so audio drifted
+    ~40ms later at every concat join. Audio is AAC-encoded once, after the join.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
 
     Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
-      - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
+      - final (default): source resolution, source color (HDR kept),
+                         HEVC Main 10 via `final_video_args`
+      - preview:         1080p libx264 medium CRF 22, SDR (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
-
-    vf_parts: list[str] = []
-    if is_hdr_source(source):
-        vf_parts.append(TONEMAP_CHAIN)
-    vf_parts.append(scale)
-    if grade_filter:
-        vf_parts.append(grade_filter)
-    vf = ",".join(vf_parts)
-
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
-    fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
-
-    if draft:
-        preset, crf = "ultrafast", "28"
-    elif preview:
-        preset, crf = "medium", "22"
-    else:
-        preset, crf = "fast", "20"
+    final = not (preview or draft)
 
     # Frame rate: use the rate the caller resolved once for the whole render
     # (every segment must share it — concat -c copy in Rule 2 requires a uniform
@@ -387,16 +508,59 @@ def extract_segment(
     # own rate; fall back to 24 only if it can't be probed.
     out_rate = rate if rate is not None else (probe_source_fps(source) or "24")
 
+    vf_parts: list[str] = []
+    if not final:
+        portrait = is_portrait_source(source)
+        if draft:
+            scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        else:
+            scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        if is_hdr_source(source):
+            vf_parts.append(TONEMAP_CHAIN)
+        vf_parts.append(scale)
+    if grade_filter:
+        vf_parts.append(grade_filter)
+    if speed != 1.0:
+        # `fps=...:round=near` picks the nearest source frame for each output
+        # frame. Without it, `-fps_mode cfr` rounds late and video trails the
+        # time-stretched audio by up to ~50ms at 1.1x.
+        vf_parts.append(f"setpts=(PTS-STARTPTS)/{speed}")
+        vf_parts.append(f"fps={out_rate}:round=near")
+
+    # Output length snapped to a whole number of frames. ffmpeg keeps the full
+    # last video frame past `-t`, so an off-grid length leaves video up to one
+    # frame longer than audio — and those gaps accumulate across concat joins.
+    # `-frames:v` pins the exact video frame count; `-t` trims audio to match.
+    frame = 1 / Fraction(out_rate)
+    out_frames = max(1, round(Fraction(duration / speed) / frame))
+    out_duration = float(out_frames * frame)
+
+    # 30ms audio fades at both edges (Rule 3) — prevent pops. Fades run after
+    # the tempo change, so they're placed on the output timeline.
+    fade_out_start = max(0.0, out_duration - 0.03)
+    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    if speed != 1.0:
+        af = f"{atempo_chain(speed)},{af}"
+
+    if final:
+        video_args = final_video_args(source)
+    else:
+        preset, crf = ("ultrafast", "28") if draft else ("medium", "22")
+        video_args = ["-c:v", "libx264", "-preset", preset, "-crf", crf,
+                      "-pix_fmt", "yuv420p"]
+
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
+        "-t", f"{out_duration:.6f}",
+        *(["-vf", ",".join(vf_parts)] if vf_parts else []),
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", out_rate,
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        *video_args,
+        "-frames:v", str(out_frames),
+        "-r", out_rate, *(["-fps_mode", "cfr"] if final else []),
+        *(["-c:a", "pcm_s16le"] if final else ["-c:a", "aac", "-b:a", "192k"]),
+        "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -409,22 +573,30 @@ def extract_all_segments(
     preview: bool,
     draft: bool = False,
     fps: str | None = None,
+    ranges: list[dict] | None = None,
+    prefix: str = "seg",
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
+
+    `ranges` overrides the EDL's top-level ranges (used for hooks),
+    and `prefix` keeps each group's segment files distinct.
 
     If the EDL `grade` is "auto", analyze each segment range with
     `auto_grade_for_clip` and apply a per-segment subtle correction.
     Otherwise, apply the same preset/raw filter to every segment.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
+    speed = float(edl.get("speed", 1.0))
+    if speed <= 0:
+        sys.exit(f"EDL speed must be greater than zero, got {speed}")
     is_auto = resolved == "__AUTO__"
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
     clips_dir.mkdir(parents=True, exist_ok=True)
 
-    ranges = edl["ranges"]
+    ranges = edl["ranges"] if ranges is None else ranges
     sources = edl["sources"]
 
     # Resolve ONE output frame rate for the entire render and apply it to every
@@ -451,7 +623,9 @@ def extract_all_segments(
         start = float(r["start"])
         end = verify_segment_end(src_path, start, float(r["end"]))
         duration = end - start
-        out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
+        # Final segments carry PCM audio, which needs .mov (see extract_segment).
+        ext = ".mp4" if (preview or draft) else ".mov"
+        out_path = clips_dir / f"{prefix}_{i:02d}_{src_name}{ext}"
 
         if is_auto:
             seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
@@ -462,26 +636,188 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate, speed=speed)
         seg_paths.append(out_path)
 
     return seg_paths
 
 
+
+# -------- Hook + body pieces ------------------------------------------------
+
+HOOK_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+BODY_NAME = "body"
+DELIVER_DIR = "deliver"  # only final videos + caption transcripts
+# iCloud Drive's local folder; files copied here sync to the phone untouched.
+ICLOUD_DRIVE = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+
+
+def render_pieces(
+    edl: dict,
+    edit_dir: Path,
+    preview: bool = False,
+    draft: bool = False,
+    fps: str | None = None,
+    loudnorm: bool = True,
+) -> list[Path]:
+    """One file per hook plus one shared body file, stitched later on the phone.
+
+    Each entry in `hooks` ({"name": ..., "ranges": [...]}) becomes
+    edit_dir/deliver/<name>.mp4 and the EDL's top-level `ranges` become
+    edit_dir/deliver/body.mp4, next to the caption transcripts, so deliver/
+    holds only what the user AirDrops. Preview/draft renders get a suffix and
+    stay in edit_dir. Every piece gets the same audio gain, set from the body, so
+    there is no level jump where a hook is stitched onto the body.
+    """
+    hooks = edl.get("hooks") or []
+    if not hooks:
+        sys.exit("EDL has no hooks")
+    if not edl.get("ranges"):
+        sys.exit("EDL has hooks but no body ranges")
+    names = [h.get("name", "") for h in hooks]
+    for h, name in zip(hooks, names):
+        if not HOOK_NAME_RE.fullmatch(name):
+            sys.exit(f"hook name must match [A-Za-z0-9_-]+, got {name!r}")
+        if name == BODY_NAME:
+            sys.exit(f"hook name {BODY_NAME!r} is reserved for the body file")
+        if not h.get("ranges"):
+            sys.exit(f"hook {name!r} has no ranges")
+    if len(set(names)) != len(names):
+        sys.exit(f"hook names must be unique: {names}")
+
+    ignored = [k for k in ("grade", "overlays", "subtitles") if edl.get(k)]
+    if ignored:
+        print(f"warning: {', '.join(ignored)} not supported with hooks — ignoring")
+    edl = {**edl, "grade": None}
+
+    # One rate for every piece, so they stitch cleanly (Rule 2).
+    if fps is not None:
+        rate = parse_fps(str(fps))
+    else:
+        first = resolve_path(edl["sources"][edl["ranges"][0]["source"]], edit_dir)
+        rate = probe_source_fps(first) or "24"
+
+    suffix = "_draft" if draft else ("_preview" if preview else "")
+    deliver_dir = edit_dir / DELIVER_DIR
+    pieces = [(BODY_NAME, extract_all_segments(
+        edl, edit_dir, preview, draft=draft, fps=rate, prefix=BODY_NAME))]
+    for hook, name in zip(hooks, names):
+        segs = extract_all_segments(
+            edl, edit_dir, preview, draft=draft, fps=rate,
+            ranges=hook["ranges"], prefix=name,
+        )
+        pieces.append((name, segs))
+        write_variant_transcript(edl, hook, edit_dir, deliver_dir)
+    pieces.append(pieces.pop(0))  # hooks first, body last
+
+    # Finals go to deliver/ (just what the user AirDrops); previews stay in edit/.
+    out_dir = edit_dir if suffix else deliver_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = [out_dir / f"{name}{suffix}.mp4" for name, _ in pieces]
+    if not loudnorm:
+        for (name, segs), out_path in zip(pieces, outputs):
+            concat_segments(segs, out_path, edit_dir, encode_audio=True)
+        return outputs
+
+    # Joined audio stays uncompressed; the gain step does the one AAC encode.
+    joined = [edit_dir / f"{name}{suffix}.prenorm{segs[0].suffix}" for name, segs in pieces]
+    for (_, segs), path in zip(pieces, joined):
+        concat_segments(segs, path, edit_dir)
+    gain = shared_gain_db([measure_loudness(p) for p in joined])
+    print(f"  loudness: +{gain:.2f} dB on every piece" if gain >= 0
+          else f"  loudness: {gain:.2f} dB on every piece")
+    for path, out_path in zip(joined, outputs):
+        apply_gain(path, out_path, gain)
+        path.unlink(missing_ok=True)
+    if not suffix:
+        publish_to_icloud(deliver_dir, ICLOUD_DRIVE)
+    return outputs
+
+
+def publish_to_icloud(deliver_dir: Path, icloud_root: Path) -> Path | None:
+    """Copy everything in deliver_dir to <iCloud Drive>/Reels/<slug>/, where
+    slug is the recording's folder name (edit/ sits inside it). iCloud syncs
+    the files to the phone uncompressed. A re-render replaces them in place.
+
+    Returns the destination, or None (with a warning) if iCloud Drive is
+    missing or macOS blocks access; the local deliver/ folder is unaffected.
+    """
+    slug = deliver_dir.parent.parent.name
+    dest = icloud_root / "Reels" / slug
+    try:
+        if not icloud_root.is_dir():
+            raise FileNotFoundError(icloud_root)
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in sorted(deliver_dir.iterdir()):
+            if f.is_file():
+                shutil.copy2(f, dest / f.name)
+    except OSError as e:
+        print(f"warning: could not copy to iCloud Drive ({e}) — files are only in {deliver_dir}")
+        return None
+    print(f"icloud: copied {deliver_dir.name}/ → iCloud Drive/Reels/{slug}/")
+    return dest
+
+
+def shared_gain_db(measurements: list[dict | None]) -> float:
+    """One gain for all pieces: bring the body (last) to LOUDNORM_I.
+
+    The pieces come from one recording with one mic, so a single gain keeps
+    them at the same level; normalizing each on its own would not, because a
+    short hook's integrated loudness reads differently from the body's.
+    Peaks are left to the limiter in apply_gain, not used to cap the gain:
+    quiet, peaky speech would otherwise land several dB under the target.
+    """
+    body = measurements[-1]
+    if body is None:
+        print("  warning: body loudness measurement failed — leaving levels as recorded")
+        return 0.0
+    return LOUDNORM_I - float(body["input_i"])
+
+
+def apply_gain(input_path: Path, output_path: Path, gain_db: float) -> None:
+    """Apply a fixed audio gain, then a peak limiter, and do the single AAC
+    encode; video is copied. The limiter settings are the same for every piece,
+    so pieces stitched together get identical treatment."""
+    # Sample-peak limit a little under LOUDNORM_TP: true peaks (and AAC
+    # overshoot) sit slightly above sample peaks; _enforce_true_peak_ceiling
+    # catches the rest.
+    limit = 10 ** ((LOUDNORM_TP - 0.5) / 20)
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-nostats",
+        "-i", str(input_path),
+        "-c:v", "copy",
+        "-af", f"volume={gain_db:.3f}dB,alimiter=limit={limit:.4f}"
+               ":attack=5:release=50:level=disabled",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    print(f"  gain → {output_path.name}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _enforce_true_peak_ceiling(output_path)
+
+
 # -------- Lossless concat ----------------------------------------------------
 
 
-def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
-    """Lossless concat via the concat demuxer. No re-encode."""
+def concat_segments(
+    segment_paths: list[Path], out_path: Path, edit_dir: Path, encode_audio: bool = False
+) -> None:
+    """Lossless concat via the concat demuxer. Video is never re-encoded.
+
+    `encode_audio` compresses the joined (PCM) audio to AAC in this same pass,
+    for outputs that get no later audio step.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     concat_list = edit_dir / "_concat.txt"
     concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
         "-c", "copy",
+        *(["-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if encode_audio else []),
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -517,6 +853,41 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
             continue
         out.append(w)
     return out
+
+
+def write_variant_transcript(
+    edl: dict, hook: dict, edit_dir: Path, out_dir: Path | None = None
+) -> Path | None:
+    """Write the exact spoken words of one variant (hook, then body) to
+    out_dir/<hook name>_transcript.md (default edit_dir), for the post caption.
+
+    Returns the path, or None if a source transcript is missing.
+    """
+    transcripts: dict[str, dict] = {}
+
+    def spoken(ranges: list[dict]) -> str | None:
+        words: list[str] = []
+        for r in ranges:
+            src = r["source"]
+            if src not in transcripts:
+                path = edit_dir / "transcripts" / f"{src}.json"
+                if not path.exists():
+                    print(f"warning: no transcript at {path} — skipping transcript for {hook['name']}")
+                    return None
+                transcripts[src] = json.loads(path.read_text(encoding="utf-8"))
+            words += [w["text"].strip() for w in
+                      _words_in_range(transcripts[src], float(r["start"]), float(r["end"]))]
+        return " ".join(words)
+
+    hook_text = spoken(hook["ranges"])
+    body_text = spoken(edl["ranges"]) if hook_text is not None else None
+    if body_text is None:
+        return None
+    out_dir = out_dir or edit_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{hook['name']}_transcript.md"
+    out_path.write_text(f"{hook_text}\n\n{body_text}\n", encoding="utf-8")
+    return out_path
 
 
 def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
@@ -611,7 +982,7 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
         f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json"
     )
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        FFMPEG, "-y", "-hide_banner", "-nostats",
         "-i", str(video_path),
         "-af", filter_str,
         "-vn", "-f", "null", "-",
@@ -635,6 +1006,40 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
     return data
 
 
+def _enforce_true_peak_ceiling(path: Path, max_attempts: int = 2) -> None:
+    """Verify the real encoded file's true peak and trim it if needed.
+
+    loudnorm's own gain calculation (both linear and dynamic mode) targets
+    LOUDNORM_TP on the pre-encode PCM signal, but lossy AAC encoding can add
+    inter-sample overshoot on top of that — observed on real content: a
+    loudnorm pass targeting -1 dBTP produced a +0.3 dBTP *encoded* file
+    (confirmed reproducible in both linear and dynamic modes, so this is an
+    encoding-stage effect, not a loudnorm mode bug). Trust the measurement
+    of what actually got shipped, not what loudnorm aimed for pre-encode.
+    """
+    for _ in range(max_attempts):
+        check = measure_loudness(path)
+        if check is None:
+            return
+        overshoot = float(check["input_tp"]) - LOUDNORM_TP
+        if overshoot <= 0.05:
+            return
+        print(f"    true peak {check['input_tp']} dBTP overshoots target by "
+              f"{overshoot:.2f} dB after encoding — trimming")
+        trimmed = path.with_name(path.stem + ".tptrim" + path.suffix)
+        cmd = [
+            FFMPEG, "-y", "-hide_banner", "-nostats",
+            "-i", str(path),
+            "-c:v", "copy",
+            "-af", f"volume=-{overshoot + 0.1:.3f}dB",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(trimmed),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        trimmed.replace(path)
+
+
 def apply_loudnorm_two_pass(
     input_path: Path,
     output_path: Path,
@@ -652,7 +1057,7 @@ def apply_loudnorm_two_pass(
         # One-pass approximation — faster, slightly less accurate.
         filter_str = f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            FFMPEG, "-y", "-hide_banner", "-nostats",
             "-i", str(input_path),
             "-c:v", "copy",
             "-af", filter_str,
@@ -662,6 +1067,7 @@ def apply_loudnorm_two_pass(
         ]
         print(f"  loudnorm (1-pass preview) → {output_path.name}")
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _enforce_true_peak_ceiling(output_path)
         return True
 
     # Full two-pass
@@ -684,7 +1090,7 @@ def apply_loudnorm_two_pass(
         f":linear=true"
     )
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        FFMPEG, "-y", "-hide_banner", "-nostats",
         "-i", str(input_path),
         "-c:v", "copy",
         "-af", filter_str,
@@ -694,6 +1100,7 @@ def apply_loudnorm_two_pass(
     ]
     print(f"  loudnorm pass 2: normalizing → {output_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _enforce_true_peak_ceiling(output_path)
     return True
 
 
@@ -716,7 +1123,7 @@ def build_final_composite(
 
     if not has_overlays and not has_subs:
         # Nothing to do — just rename/copy base to final name
-        run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
+        run([FFMPEG, "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
     inputs: list[str] = ["-i", str(base_path)]
@@ -768,7 +1175,7 @@ def build_final_composite(
     filter_complex = ";".join(filter_parts)
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
@@ -790,7 +1197,12 @@ def build_final_composite(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
-    ap.add_argument("-o", "--output", type=Path, required=True, help="Output video path")
+    ap.add_argument(
+        "-o", "--output", type=Path,
+        help="Output video path. Required unless the EDL has `hooks`, in which "
+             "case each hook is written to <edl dir>/deliver/<hook name>.mp4 "
+             "and the shared body to <edl dir>/deliver/body.mp4.",
+    )
     ap.add_argument(
         "--preview",
         action="store_true",
@@ -832,6 +1244,21 @@ def main() -> None:
 
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
+
+    if edl.get("hooks"):
+        if args.output:
+            print("note: -o is ignored when the EDL has hooks")
+        outputs = render_pieces(
+            edl, edit_dir, preview=args.preview, draft=args.draft,
+            fps=args.fps, loudnorm=not args.no_loudnorm,
+        )
+        print()
+        for out in outputs:
+            print(f"done: {out} ({out.stat().st_size / (1024 * 1024):.1f} MB)")
+        return
+
+    if not args.output:
+        sys.exit("-o/--output is required when the EDL has no hooks")
     out_path = args.output.resolve()
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
@@ -847,7 +1274,7 @@ def main() -> None:
     else:
         base_name = "base.mp4"
     base_path = edit_dir / base_name
-    concat_segments(segment_paths, base_path, edit_dir)
+    concat_segments(segment_paths, base_path, edit_dir, encode_audio=True)
 
     # 3. Subtitles: build if requested, resolve final path
     subs_path: Path | None = None

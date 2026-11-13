@@ -64,6 +64,11 @@ class ProbeSourceFpsTests(unittest.TestCase):
         with patch.object(render.subprocess, "run", return_value=result):
             self.assertEqual(render.probe_source_fps(Path("source.mp4")), "30000/1001")
 
+    def test_snaps_iphone_jittered_average_to_nominal(self):
+        result = self._probe_result("961000/32041", "30/1")
+        with patch.object(render.subprocess, "run", return_value=result):
+            self.assertEqual(render.probe_source_fps(Path("source.mov")), "30/1")
+
     def test_falls_back_to_nominal_rate(self):
         result = self._probe_result("0/0", "60/1")
         with patch.object(render.subprocess, "run", return_value=result):
